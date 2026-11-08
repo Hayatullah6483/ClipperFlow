@@ -1,0 +1,6 @@
+{
+  "name": "AI Clipper",
+  "description": "Upload. Cut. Preview. Download. Professional, high-precision local video clipper with manual timestamp entry and zero cloud upload.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

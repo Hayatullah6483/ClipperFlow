@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "UserPreference": {
+      "title": "UserPreference",
+      "description": "Stores authenticated user profile metadata and application preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user.",
+          "maxLength": 100
+        },
+        "defaultClipCount": {
+          "type": "integer",
+          "description": "Default number of clips planned per video upload (1 to 20)."
+        },
+        "defaultProcessingMode": {
+          "type": "string",
+          "description": "Default video cutting precision mode.",
+          "enum": ["accurate-reencode", "stream-copy"]
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of last update."
+        }
+      },
+      "required": ["uid", "defaultClipCount", "defaultProcessingMode", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserPreference"
+      },
+      "description": "Stores non-PII user studio settings and preferences."
+    }
+  }
+}
