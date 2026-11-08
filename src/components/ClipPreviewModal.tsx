@@ -52,7 +52,7 @@ export const ClipPreviewModal: React.FC<ClipPreviewModalProps> = ({
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const extensionToUse = clip.processingMode === 'stream-copy' ? sourceExtension : 'mp4';
+  const extensionToUse = clip.outputExtension || 'mp4';
   const sanitizedFilename = sanitizeFilename(title, extensionToUse);
 
   const togglePlay = () => {

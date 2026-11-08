@@ -11,7 +11,7 @@ import { TimestampValidation } from '../types';
  * @param includeMilliseconds Whether to include .mmm
  */
 export function formatSecondsToTime(seconds: number, includeMilliseconds = false): string {
-  if (isNaN(seconds) || seconds < 0) {
+  if (!Number.isFinite(seconds) || isNaN(seconds) || seconds < 0) {
     return includeMilliseconds ? '00:00:00.000' : '00:00:00';
   }
 
@@ -148,7 +148,7 @@ export function validateTimestamps(
     };
   }
 
-  if (videoDuration > 0 && endSec > videoDuration + 0.1) {
+  if (Number.isFinite(videoDuration) && videoDuration > 0 && endSec > videoDuration + 0.1) {
     return {
       isValid: false,
       startSeconds: startSec,

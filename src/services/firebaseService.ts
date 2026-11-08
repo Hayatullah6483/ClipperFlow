@@ -62,10 +62,12 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Validate connection to Firestore on boot
+// Validate connection to Firestore on boot silently
 async function testConnection() {
   try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
+    if (auth.currentUser) {
+      await getDocFromServer(doc(db, 'users', auth.currentUser.uid));
+    }
   } catch (error) {
     if (error instanceof Error && error.message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration.');

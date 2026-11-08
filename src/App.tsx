@@ -22,6 +22,7 @@ import { Project, Clip, VideoMetadata, ProcessingMode, ActiveTab, StorageInfo } 
 import { extractVideoMetadata, sanitizeFilename } from './utils/fileValidation';
 import { formatSecondsToTime } from './utils/timeFormat';
 import { processClip } from './services/videoProcessor';
+import { ffmpegService } from './services/ffmpegService';
 import { generateSampleVideoFile } from './utils/sampleVideoGenerator';
 import {
   saveProject,
@@ -125,13 +126,15 @@ export default function App() {
     }
   };
 
-  // Keep project saved in IndexedDB whenever project metadata or clips change
+  // Keep project saved in IndexedDB (debounced so live progress percentage ticks remain 60fps smooth)
   useEffect(() => {
-    if (currentProject.clips.length > 0 || metadata) {
+    if (currentProject.clips.length === 0 && !metadata) return;
+    const timer = setTimeout(() => {
       saveProject(currentProject)
         .then(() => loadProjectsList())
         .catch((e) => console.warn('Autosave project error:', e));
-    }
+    }, 600);
+    return () => clearTimeout(timer);
   }, [currentProject, metadata]);
 
   // Google Sign-In handler
@@ -164,15 +167,20 @@ export default function App() {
         URL.revokeObjectURL(videoUrl);
       }
 
-      const meta = await extractVideoMetadata(file);
+      const knownDur = (file as any).__knownDuration || 0;
+      const meta = await extractVideoMetadata(file, knownDur);
       const url = URL.createObjectURL(file);
+
+      // Pre-warm FFmpeg WebAssembly engine in background so it is ready when user clicks Process
+      ffmpegService.preload();
 
       setSourceFile(file);
       setVideoUrl(url);
       setMetadata(meta);
       setCurrentTime(0);
       setTargetStartTime(0);
-      setTargetEndTime(Math.min(15, meta.duration));
+      const safeEnd = meta.duration > 0 ? Math.min(15, meta.duration) : 15;
+      setTargetEndTime(safeEnd);
 
       const updatedProject: Project = {
         id: `proj_${Date.now()}`,
@@ -251,12 +259,13 @@ export default function App() {
     }
   };
 
-  // 1-Click Sample generator
+  // 1-Click Sample generator (fast 3-second HD test pattern)
   const handleTrySampleFromLanding = async () => {
     try {
       setIsLoadingVideo(true);
       setActiveTab('studio');
-      const sampleFile = await generateSampleVideoFile(14);
+      showToast('Generating 3-second HD test video pattern...', 'info');
+      const sampleFile = await generateSampleVideoFile(3);
       await handleVideoSelected(sampleFile);
     } catch (err: any) {
       showToast('Failed to generate sample: ' + (err?.message || 'Unknown error'), 'error');
@@ -352,10 +361,12 @@ export default function App() {
       directClip || currentProject.clips.find((c) => c.id === clipId);
     if (!clipToProcess) return;
 
+    let highestPercent = 2;
+
     updateClipState(clipId, {
       status: 'processing',
-      progress: 5,
-      progressMessage: 'Queued in background worker...',
+      progress: highestPercent,
+      progressMessage: 'Starting clip processor (2%)...',
       error: undefined,
     });
 
@@ -366,21 +377,37 @@ export default function App() {
         clipToProcess.endTime,
         clipToProcess.processingMode,
         (percentage, message) => {
+          highestPercent = Math.max(highestPercent, Math.min(99, Math.round(percentage)));
           updateClipState(clipId, {
-            progress: percentage,
-            progressMessage: message,
+            status: 'processing',
+            progress: highestPercent,
+            progressMessage: message || `Processing (${highestPercent}%)...`,
           });
-        }
+        },
+        { width: metadata?.width, height: metadata?.height }
       );
+
+      const dimsLabel =
+        metadata && metadata.width && metadata.height
+          ? `${metadata.width}×${metadata.height} (${metadata.aspectRatio})`
+          : undefined;
 
       updateClipState(clipId, {
         status: 'ready',
         progress: 100,
-        progressMessage: 'Ready to preview and download',
+        progressMessage: 'Completed (100%) — Original ratio preserved',
         blobUrl: result.url,
         blobSize: result.blob.size,
+        outputExtension: result.extension,
+        outputMimeType: result.mimeType,
+        outputDimensions: dimsLabel,
         completedAt: Date.now(),
       });
+
+      showToast(
+        `${clipToProcess.title} processed (100%) in original ratio (${dimsLabel || '1:1 Original'}) — ready to download!`,
+        'success'
+      );
     } catch (err: any) {
       console.error('Clip processing error:', err);
       updateClipState(clipId, {
@@ -476,10 +503,7 @@ export default function App() {
       return;
     }
 
-    const ext =
-      clip.processingMode === 'stream-copy'
-        ? metadata?.format?.toLowerCase() || 'mp4'
-        : 'mp4';
+    const ext = clip.outputExtension || 'mp4';
     const filename = sanitizeFilename(trimmedTitle, ext);
 
     const a = document.createElement('a');
@@ -598,8 +622,8 @@ export default function App() {
                   onOpenStudio={() => setActiveTab('studio')}
                   onTrySample={handleTrySampleFromLanding}
                   onUploadClick={() => {
+                    hiddenUploadInputRef.current?.click();
                     setActiveTab('studio');
-                    setTimeout(() => hiddenUploadInputRef.current?.click(), 100);
                   }}
                   savedProjectCount={allProjects.length}
                   onOpenHistory={() => setActiveTab('history')}

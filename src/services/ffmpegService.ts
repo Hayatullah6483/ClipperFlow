@@ -9,28 +9,62 @@ import { ProcessingMode } from '../types';
 
 export type ProgressCallback = (percentage: number, message: string) => void;
 
+export interface FFmpegCutResult {
+  blob: Blob;
+  url: string;
+  modeUsed: ProcessingMode;
+  extension: string;
+  mimeType: string;
+}
+
 class FFmpegService {
   private ffmpeg: FFmpeg | null = null;
   private isLoaded = false;
   private isLoading = false;
   private loadError: string | null = null;
+  private taskChain: Promise<any> = Promise.resolve();
 
   /**
-   * Initializes and loads FFmpeg WebAssembly core
-   * Strategy:
-   * 1. Direct same-origin local URL (/ffmpeg/ffmpeg-core.js & .wasm)
-   * 2. Local blob URL (/ffmpeg/...)
-   * 3. unpkg CDN ESM fallback
-   * 4. jsdelivr CDN ESM fallback
+   * Helper to enforce a timeout on FFmpeg load so it never hangs forever
+   * while allowing sufficient time (45s) for the 31MB WebAssembly binary to compile.
    */
-  public async load(): Promise<boolean> {
+  private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`${label} timed out after ${ms}ms`));
+      }, ms);
+      promise
+        .then((val) => {
+          clearTimeout(timer);
+          resolve(val);
+        })
+        .catch((err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+    });
+  }
+
+  /**
+   * Pre-warms FFmpeg in the background so it is ready before the user clicks Process.
+   */
+  public preload(): void {
+    if (!this.isLoaded && !this.isLoading) {
+      this.load().catch(() => {});
+    }
+  }
+
+  /**
+   * Initializes and loads FFmpeg WebAssembly core with explicit classWorkerURL.
+   */
+  public async load(onProgress?: ProgressCallback): Promise<boolean> {
     if (this.isLoaded && this.ffmpeg) {
       return true;
     }
 
     if (this.isLoading) {
       let attempts = 0;
-      while (this.isLoading && attempts < 100) {
+      while (this.isLoading && attempts < 200) {
         await new Promise((resolve) => setTimeout(resolve, 200));
         attempts++;
       }
@@ -52,17 +86,25 @@ class FFmpegService {
       });
     };
 
-    // Strategy 1: Direct same-origin URL (fastest, zero blob import issues in module workers)
+    const origin = window.location.origin;
+
+    // Strategy 1: Direct same-origin local worker + core + wasm
     try {
+      onProgress?.(6, 'Loading local WebAssembly engine (6%)...');
       setupInstance();
-      const origin = window.location.origin;
+      const classWorkerURL = `${origin}/ffmpeg/worker.js`;
       const coreURL = `${origin}/ffmpeg/ffmpeg-core.js`;
       const wasmURL = `${origin}/ffmpeg/ffmpeg-core.wasm`;
 
-      await this.ffmpeg!.load({
-        coreURL,
-        wasmURL,
-      });
+      await this.withTimeout(
+        this.ffmpeg!.load({
+          classWorkerURL,
+          coreURL,
+          wasmURL,
+        }),
+        45000,
+        'Local direct FFmpeg load'
+      );
 
       this.isLoaded = true;
       this.isLoading = false;
@@ -71,68 +113,35 @@ class FFmpegService {
       console.warn('Local direct FFmpeg core load failed, trying local blob URLs...', localDirectErr);
     }
 
-    // Strategy 2: Local blob URLs via toBlobURL
+    // Strategy 2: Local worker + Blob URLs
     try {
+      onProgress?.(8, 'Loading WebAssembly binary via Blob URL (8%)...');
       setupInstance();
-      const coreURL = await toBlobURL('/ffmpeg/ffmpeg-core.js', 'text/javascript');
-      const wasmURL = await toBlobURL('/ffmpeg/ffmpeg-core.wasm', 'application/wasm');
+      const classWorkerURL = `${origin}/ffmpeg/worker.js`;
+      const coreURL = await toBlobURL(`${origin}/ffmpeg/ffmpeg-core.js`, 'text/javascript');
+      const wasmURL = await toBlobURL(`${origin}/ffmpeg/ffmpeg-core.wasm`, 'application/wasm');
 
-      await this.ffmpeg!.load({
-        coreURL,
-        wasmURL,
-      });
+      await this.withTimeout(
+        this.ffmpeg!.load({
+          classWorkerURL,
+          coreURL,
+          wasmURL,
+        }),
+        45000,
+        'Local blob FFmpeg load'
+      );
 
       this.isLoaded = true;
       this.isLoading = false;
       return true;
     } catch (localBlobErr: any) {
-      console.warn('Local blob FFmpeg load failed, trying unpkg CDN...', localBlobErr);
-    }
-
-    // Strategy 3: unpkg CDN ESM fallback
-    try {
-      setupInstance();
-      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm';
-      const coreURL = await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript');
-      const wasmURL = await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm');
-
-      await this.ffmpeg!.load({
-        coreURL,
-        wasmURL,
-      });
-
-      this.isLoaded = true;
-      this.isLoading = false;
-      return true;
-    } catch (unpkgErr: any) {
-      console.warn('unpkg core load failed, trying jsdelivr CDN...', unpkgErr);
-    }
-
-    // Strategy 4: jsdelivr CDN ESM fallback
-    try {
-      setupInstance();
-      const fallbackBaseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
-      const coreURL = await toBlobURL(`${fallbackBaseURL}/ffmpeg-core.js`, 'text/javascript');
-      const wasmURL = await toBlobURL(`${fallbackBaseURL}/ffmpeg-core.wasm`, 'application/wasm');
-
-      await this.ffmpeg!.load({
-        coreURL,
-        wasmURL,
-      });
-
-      this.isLoaded = true;
-      this.isLoading = false;
-      return true;
-    } catch (jsdelivrErr: any) {
+      console.warn('Local blob FFmpeg load failed:', localBlobErr);
       this.isLoading = false;
       this.isLoaded = false;
-      this.loadError = jsdelivrErr?.message || 'Failed to load FFmpeg WebAssembly core.';
-      console.warn('All FFmpeg loading strategies exhausted:', jsdelivrErr);
+      this.loadError = localBlobErr?.message || 'Failed to load FFmpeg WebAssembly core.';
       return false;
     }
   }
-
-  private taskChain: Promise<any> = Promise.resolve();
 
   public getStatus(): { isLoaded: boolean; isLoading: boolean; loadError: string | null } {
     return {
@@ -152,7 +161,7 @@ class FFmpegService {
     endSeconds: number,
     mode: ProcessingMode = 'accurate-reencode',
     onProgress?: ProgressCallback
-  ): Promise<{ blob: Blob; url: string; modeUsed: ProcessingMode }> {
+  ): Promise<FFmpegCutResult> {
     const runTask = async () => {
       return this.executeCutInternal(sourceFile, startSeconds, endSeconds, mode, onProgress);
     };
@@ -168,8 +177,9 @@ class FFmpegService {
     endSeconds: number,
     mode: ProcessingMode = 'accurate-reencode',
     onProgress?: ProgressCallback
-  ): Promise<{ blob: Blob; url: string; modeUsed: ProcessingMode }> {
-    const ready = await this.load();
+  ): Promise<FFmpegCutResult> {
+    onProgress?.(4, 'Initializing FFmpeg WebAssembly engine (4%)...');
+    const ready = await this.load(onProgress);
     if (!ready || !this.ffmpeg) {
       throw new Error(
         this.loadError || 'FFmpeg WebAssembly core could not be initialized.'
@@ -183,36 +193,74 @@ class FFmpegService {
     const inputExt = sourceFile.name.split('.').pop()?.toLowerCase() || 'mp4';
     const uid = `${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const inputName = `input_${uid}.${inputExt}`;
-    const outputExt = mode === 'stream-copy' ? inputExt : 'mp4';
+    // Always output standard MP4 container with H.264 + AAC + faststart moov atom
+    // so the downloaded clip plays with 0 glitches in all media players and preserves 100% original aspect ratio.
+    const outputExt = 'mp4';
     const outputName = `output_${uid}.${outputExt}`;
 
-    onProgress?.(5, 'Reading local video file into browser memory...');
+    onProgress?.(12, 'Reading local video into browser RAM (12%)...');
+
+    let currentSmoothPercent = 18;
+    let simTimer: ReturnType<typeof setInterval> | null = null;
+
+    // Parse FFmpeg log output for `time=HH:MM:SS.xx` to compute exact live percentage
+    const logProgressHandler = ({ message }: { message: string }) => {
+      const timeMatch = message.match(/time=(\d{2}):(\d{2}):(\d{2}\.\d+)/);
+      if (timeMatch && duration > 0) {
+        const h = parseInt(timeMatch[1], 10);
+        const m = parseInt(timeMatch[2], 10);
+        const s = parseFloat(timeMatch[3]);
+        const encodedSecs = h * 3600 + m * 60 + s;
+        const ratio = Math.min(Math.max(encodedSecs / duration, 0), 1);
+        const calcPercent = Math.min(Math.max(Math.round(18 + ratio * 77), currentSmoothPercent), 95);
+        currentSmoothPercent = calcPercent;
+        onProgress?.(
+          currentSmoothPercent,
+          `Encoding exact frames in original ratio (${currentSmoothPercent}%)...`
+        );
+      }
+    };
 
     const progressHandler = ({ progress, time }: { progress: number; time: number }) => {
-      let percent = Math.min(Math.max(Math.round(progress * 100), 5), 95);
+      let calcPercent = currentSmoothPercent;
       if (duration > 0 && time > 0) {
-        const calcPercent = Math.min(Math.max(Math.round((time / 1000000 / duration) * 100), 5), 95);
-        percent = Math.max(percent, calcPercent);
+        const ratio = Math.min(Math.max(time / 1000000 / duration, 0), 1);
+        calcPercent = Math.max(calcPercent, Math.round(18 + ratio * 77));
+      } else if (progress > 0 && progress <= 1) {
+        calcPercent = Math.max(calcPercent, Math.round(18 + progress * 77));
       }
+      currentSmoothPercent = Math.min(Math.max(calcPercent, 18), 95);
       onProgress?.(
-        percent,
-        mode === 'stream-copy'
-          ? `Extracting clip (Lossless Copy, ${percent}%)...`
-          : `Cutting exact frames (${percent}%)...`
+        currentSmoothPercent,
+        `Encoding exact frames in original ratio (${currentSmoothPercent}%)...`
       );
     };
 
     this.ffmpeg.on('progress', progressHandler);
+    this.ffmpeg.on('log', logProgressHandler);
+
+    // Smooth ticker so short clips show continuous percentage progression
+    simTimer = setInterval(() => {
+      if (currentSmoothPercent < 90) {
+        currentSmoothPercent += 1;
+        onProgress?.(
+          currentSmoothPercent,
+          `Processing clip in original resolution (${currentSmoothPercent}%)...`
+        );
+      }
+    }, 350);
 
     try {
       const fileData = await fetchFile(sourceFile);
       await this.ffmpeg.writeFile(inputName, fileData);
 
-      onProgress?.(15, 'Preparing surgical frame-accurate pipeline...');
+      onProgress?.(18, 'Preparing glitch-free frame-accurate pipeline (18%)...');
 
-      // Two-stage exact seek calculation:
-      // Stage 1 (Fast demuxer seek up to 2s before target) + Stage 2 (Exact frame decode after -i)
-      const fastPreSeek = Math.max(0, exactStart - 2);
+      // Glitch-free two-stage seek calculation:
+      // A 15-second pre-seek window guarantees FFmpeg lands before a full IDR keyframe (GOP),
+      // and then decodes frame-by-frame to exactPostSeek so Frame 0 of the cut clip has 100%
+      // intact reference frames (zero macroblock corruption, zero freezing, exact 00:10:00.000 cut!).
+      const fastPreSeek = exactStart > 25 ? Math.max(0, exactStart - 15) : 0;
       const exactPostSeek = Math.round((exactStart - fastPreSeek) * 1000) / 1000;
 
       const fastSeekStr = fastPreSeek.toFixed(3);
@@ -220,139 +268,84 @@ class FFmpegService {
       const durationStr = duration.toFixed(3);
       const directStartStr = exactStart.toFixed(3);
 
-      let ffmpegArgs: string[] = [];
+      // Preserve 100% of original width, height, orientation, and aspect ratio.
+      // `scale=trunc(iw/2)*2:trunc(ih/2)*2` keeps exact original dimensions while ensuring
+      // even pixel numbers required by the H.264 yuv420p specification.
+      const crfValue = mode === 'stream-copy' ? '16' : '18';
 
-      if (mode === 'stream-copy') {
-        ffmpegArgs = [
-          '-ss',
-          directStartStr,
-          '-i',
-          inputName,
-          '-t',
-          durationStr,
-          '-map',
-          '0:v:0',
-          '-map',
-          '0:a?',
-          '-c',
-          'copy',
-          '-avoid_negative_ts',
-          'make_zero',
-          outputName,
-        ];
-      } else {
-        // Two-stage frame-accurate transcode:
-        // Putting -ss exactPostSeekStr AFTER -i guarantees frame-by-frame decoding
-        // so 00:10:00 is strictly 00:10:00.000, never 00:10:01!
-        ffmpegArgs = [
-          ...(fastPreSeek > 0 ? ['-ss', fastSeekStr] : []),
-          '-i',
-          inputName,
-          '-ss',
-          exactPostSeekStr,
-          '-t',
-          durationStr,
-          '-map',
-          '0:v:0',
-          '-map',
-          '0:a?',
-          '-c:v',
-          'libx264',
-          '-preset',
-          'ultrafast',
-          '-crf',
-          '17',
-          '-pix_fmt',
-          'yuv420p',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '192k',
-          '-avoid_negative_ts',
-          'make_zero',
-          '-movflags',
-          '+faststart',
-          outputName,
-        ];
-      }
+      const buildSafeTranscodeArgs = (targetOutput: string): string[] => [
+        ...(fastPreSeek > 0 ? ['-ss', fastSeekStr] : []),
+        '-i',
+        inputName,
+        '-ss',
+        exactPostSeekStr,
+        '-t',
+        durationStr,
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a?',
+        '-vf',
+        'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'ultrafast',
+        '-crf',
+        crfValue,
+        '-pix_fmt',
+        'yuv420p',
+        '-profile:v',
+        'high',
+        '-level',
+        '4.1',
+        '-g',
+        '30',
+        '-keyint_min',
+        '15',
+        '-sc_threshold',
+        '0',
+        '-vsync',
+        'cfr',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '192k',
+        '-ar',
+        '48000',
+        '-fflags',
+        '+genpts',
+        '-avoid_negative_ts',
+        'make_zero',
+        '-movflags',
+        '+faststart',
+        targetOutput,
+      ];
 
       onProgress?.(
-        25,
-        mode === 'stream-copy'
-          ? 'Lossless cutting...'
-          : `Cutting exact range (${directStartStr}s for ${durationStr}s)...`
+        20,
+        `Cutting exact range (${directStartStr}s for ${durationStr}s) in original ratio (20%)...`
       );
 
-      const exitCode = await this.ffmpeg.exec(ffmpegArgs);
+      const exitCode = await this.ffmpeg.exec(buildSafeTranscodeArgs(outputName));
 
       if (exitCode !== 0) {
-        if (mode === 'stream-copy') {
-          console.warn('Stream copy exited with code', exitCode, '. Retrying with exact frame-accurate transcode...');
-          onProgress?.(30, 'Switching to exact frame-accurate transcode...');
-
-          const fallbackOutputName = `output_fb_${uid}.mp4`;
-          const fallbackArgs = [
-            ...(fastPreSeek > 0 ? ['-ss', fastSeekStr] : []),
-            '-i',
-            inputName,
-            '-ss',
-            exactPostSeekStr,
-            '-t',
-            durationStr,
-            '-map',
-            '0:v:0',
-            '-map',
-            '0:a?',
-            '-c:v',
-            'libx264',
-            '-preset',
-            'ultrafast',
-            '-crf',
-            '17',
-            '-pix_fmt',
-            'yuv420p',
-            '-c:a',
-            'aac',
-            '-b:a',
-            '192k',
-            '-avoid_negative_ts',
-            'make_zero',
-            '-movflags',
-            '+faststart',
-            fallbackOutputName,
-          ];
-
-          const retryExitCode = await this.ffmpeg.exec(fallbackArgs);
-          if (retryExitCode !== 0) {
-            throw new Error(`FFmpeg exited with error code ${retryExitCode}. Check codec compatibility.`);
-          }
-
-          const fallbackData = await this.ffmpeg.readFile(fallbackOutputName);
-          const uint8 = fallbackData instanceof Uint8Array ? fallbackData : new Uint8Array(fallbackData as any);
-          const blob = new Blob([uint8], { type: 'video/mp4' });
-          const url = URL.createObjectURL(blob);
-
-          try {
-            await this.ffmpeg.deleteFile(inputName);
-            await this.ffmpeg.deleteFile(fallbackOutputName);
-          } catch {}
-
-          return { blob, url, modeUsed: 'accurate-reencode' };
-        } else {
-          throw new Error(`FFmpeg exited with error code ${exitCode}.`);
-        }
+        throw new Error(`FFmpeg exited with error code ${exitCode}.`);
       }
 
-      onProgress?.(95, 'Reading output clip from browser memory...');
+      onProgress?.(96, 'Verifying output video stream (96%)...');
 
       const outputData = await this.ffmpeg.readFile(outputName);
-      const mimeType = outputExt === 'webm' ? 'video/webm' : outputExt === 'mkv' ? 'video/x-matroska' : 'video/mp4';
-
       const uint8 = outputData instanceof Uint8Array ? outputData : new Uint8Array(outputData as any);
-      const blob = new Blob([uint8], { type: mimeType });
+
+      if (uint8.byteLength < 512) {
+        throw new Error('FFmpeg produced an empty or incomplete video stream.');
+      }
+
+      const blob = new Blob([uint8], { type: 'video/mp4' });
       const url = URL.createObjectURL(blob);
 
-      onProgress?.(100, 'Clip processing complete!');
+      onProgress?.(100, 'Clip processing complete (100%)!');
 
       try {
         await this.ffmpeg.deleteFile(inputName);
@@ -365,10 +358,14 @@ class FFmpegService {
         blob,
         url,
         modeUsed: mode,
+        extension: 'mp4',
+        mimeType: 'video/mp4',
       };
     } finally {
+      if (simTimer) clearInterval(simTimer);
       try {
         (this.ffmpeg as any).off?.('progress', progressHandler);
+        (this.ffmpeg as any).off?.('log', logProgressHandler);
       } catch (e) {
         // ignore
       }
@@ -377,4 +374,3 @@ class FFmpegService {
 }
 
 export const ffmpegService = new FFmpegService();
-

@@ -56,7 +56,7 @@ export const Dropzone: React.FC<DropzoneProps> = ({ onVideoSelected, isLoading =
     try {
       setIsGeneratingSample(true);
       setErrorMessage(null);
-      const sampleFile = await generateSampleVideoFile(12);
+      const sampleFile = await generateSampleVideoFile(3);
       onVideoSelected(sampleFile);
     } catch (err: any) {
       setErrorMessage('Could not generate sample video: ' + (err?.message || 'Unknown error'));

@@ -73,7 +73,7 @@ export const ClipItem: React.FC<ClipItemProps> = ({
     }
   };
 
-  const extensionToUse = clip.processingMode === 'stream-copy' ? sourceExtension : 'mp4';
+  const extensionToUse = clip.outputExtension || 'mp4';
   const expectedDownloadFilename = sanitizeFilename(clip.title, extensionToUse);
 
   // Use processed blob URL if available, otherwise use sourceVideoUrl bounded to startTime/endTime
@@ -171,7 +171,9 @@ export const ClipItem: React.FC<ClipItemProps> = ({
             </span>
             <span className="text-zinc-300">·</span>
             <span className="text-[11px] text-zinc-500 font-sans">
-              {clip.processingMode === 'accurate-reencode' ? 'Exact Frame Precision' : 'Lossless Keyframe'}
+              {clip.outputDimensions
+                ? `Original Size: ${clip.outputDimensions}`
+                : 'Original Ratio Preserved'}
             </span>
           </div>
         </div>
@@ -204,10 +206,10 @@ export const ClipItem: React.FC<ClipItemProps> = ({
           )}
 
           {clip.status === 'processing' && (
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-100 border border-zinc-200">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-red-50 border border-[#E32636]/40 shadow-2xs">
               <Loader2 className="w-3.5 h-3.5 animate-spin text-[#E32636]" />
-              <span className="text-xs font-mono font-semibold text-zinc-800 tabular-nums">
-                {clip.progress}%
+              <span className="text-xs font-mono font-bold text-[#E32636] tabular-nums">
+                Processing {Math.min(100, Math.max(1, Math.round(clip.progress)))}%
               </span>
             </div>
           )}
@@ -273,22 +275,25 @@ export const ClipItem: React.FC<ClipItemProps> = ({
         </div>
       </div>
 
-      {/* Progress Bar for Active Processing */}
+      {/* Progress Bar with Live Percentage for Active Processing */}
       {clip.status === 'processing' && (
-        <div className="mt-3 pt-3 border-t border-zinc-100">
-          <div className="w-full bg-zinc-200 rounded-full h-1.5 overflow-hidden">
+        <div className="mt-3 pt-3 border-t border-red-200/60">
+          <div className="flex items-center justify-between text-xs mb-1.5">
+            <span className="text-[11px] font-medium text-zinc-700 truncate">
+              {clip.progressMessage || 'Trimming exact frames in background...'}
+            </span>
+            <span className="font-mono text-xs font-extrabold text-[#E32636] tabular-nums ml-2 shrink-0">
+              {Math.min(100, Math.max(1, Math.round(clip.progress)))}%
+            </span>
+          </div>
+          <div className="w-full bg-zinc-200 rounded-full h-2 overflow-hidden">
             <motion.div
-              className="bg-[#E32636] h-1.5 rounded-full"
+              className="bg-[#E32636] h-2 rounded-full"
               initial={{ width: 0 }}
-              animate={{ width: `${Math.max(clip.progress, 5)}%` }}
-              transition={{ duration: 0.3 }}
+              animate={{ width: `${Math.min(100, Math.max(clip.progress, 4))}%` }}
+              transition={{ duration: 0.25 }}
             />
           </div>
-          {clip.progressMessage && (
-            <p className="text-[11px] text-zinc-500 font-mono mt-1.5 truncate">
-              {clip.progressMessage}
-            </p>
-          )}
         </div>
       )}
 

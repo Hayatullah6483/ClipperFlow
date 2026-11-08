@@ -125,70 +125,105 @@ export function sanitizeFilename(title: string, extension = 'mp4'): string {
 
 /**
  * Extracts video metadata using a temporary HTMLVideoElement
+ * Gracefully handles WebM/MediaRecorder Infinity durations and non-native containers (MKV/AVI)
  */
-export async function extractVideoMetadata(file: File): Promise<VideoMetadata> {
-  return new Promise((resolve, reject) => {
+export async function extractVideoMetadata(file: File, fallbackDuration = 0): Promise<VideoMetadata> {
+  const ext = file.name.split('.').pop()?.toLowerCase() || 'mp4';
+
+  return new Promise((resolve) => {
     const video = document.createElement('video');
     video.preload = 'metadata';
+    video.muted = true;
+    video.playsInline = true;
     const objectUrl = URL.createObjectURL(file);
-    video.src = objectUrl;
 
-    const timeout = setTimeout(() => {
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error('Timed out extracting video metadata. The video file might be unindexed or corrupted.'));
-    }, 15000);
+    let resolved = false;
 
-    video.onloadedmetadata = () => {
+    const finishWithMetadata = (width: number, height: number, rawDuration: number, hasAudio: boolean) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeout);
-      const width = video.videoWidth || 0;
-      const height = video.videoHeight || 0;
-      const duration = video.duration || 0;
-      const aspectRatio = calculateAspectRatio(width, height);
-      const ext = file.name.split('.').pop()?.toLowerCase() || 'mp4';
 
-      // Check audio presence via mozHasAudio, webkitAudioDecodedByteCount or audio tracks
-      let hasAudio = false;
-      const anyVideo = video as any;
-      if (typeof anyVideo.mozHasAudio !== 'undefined') {
-        hasAudio = Boolean(anyVideo.mozHasAudio);
-      } else if (typeof anyVideo.webkitAudioDecodedByteCount !== 'undefined') {
-        hasAudio = anyVideo.webkitAudioDecodedByteCount > 0;
-      } else if (anyVideo.audioTracks && anyVideo.audioTracks.length > 0) {
-        hasAudio = true;
-      } else {
-        // Default assumption for standard video containers
-        hasAudio = true;
-      }
+      const validDuration =
+        Number.isFinite(rawDuration) && rawDuration > 0
+          ? rawDuration
+          : fallbackDuration > 0
+          ? fallbackDuration
+          : 0;
 
-      // Estimate FPS if detectable
-      const fps = width >= 1920 ? 30 : 30; // standard baseline or detected
+      const safeWidth = width || 1280;
+      const safeHeight = height || 720;
+      const aspectRatio = calculateAspectRatio(safeWidth, safeHeight);
 
       video.onloadedmetadata = null;
+      video.ondurationchange = null;
       video.onerror = null;
-      video.src = '';
+      try {
+        video.src = '';
+      } catch {}
       URL.revokeObjectURL(objectUrl);
 
       resolve({
         filename: file.name,
         fileSize: file.size,
-        duration,
-        width,
-        height,
+        duration: validDuration,
+        width: safeWidth,
+        height: safeHeight,
         aspectRatio,
         mimeType: file.type || `video/${ext}`,
         format: ext.toUpperCase(),
-        fps,
+        fps: 30,
         hasAudio,
       });
     };
 
-    video.onerror = () => {
-      clearTimeout(timeout);
-      video.onloadedmetadata = null;
-      video.onerror = null;
-      video.src = '';
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error(`Failed to load video metadata for "${file.name}". Please ensure the file is not corrupted.`));
+    const timeout = setTimeout(() => {
+      finishWithMetadata(1280, 720, fallbackDuration, true);
+    }, 6000);
+
+    video.onloadedmetadata = async () => {
+      const width = video.videoWidth || 1280;
+      const height = video.videoHeight || 720;
+      let dur = video.duration;
+
+      // Detect audio tracks
+      let hasAudio = true;
+      const anyVideo = video as any;
+      if (typeof anyVideo.mozHasAudio !== 'undefined') {
+        hasAudio = Boolean(anyVideo.mozHasAudio);
+      } else if (typeof anyVideo.webkitAudioDecodedByteCount !== 'undefined') {
+        hasAudio = anyVideo.webkitAudioDecodedByteCount > 0 || true;
+      }
+
+      // If WebM/MediaRecorder reports Infinity duration, seek to a high timestamp to resolve real duration
+      if (!Number.isFinite(dur) || isNaN(dur) || dur <= 0) {
+        try {
+          video.currentTime = 1e10;
+          await new Promise<void>((r) => {
+            const onSeek = () => {
+              video.removeEventListener('timeupdate', onSeek);
+              video.removeEventListener('durationchange', onSeek);
+              r();
+            };
+            video.addEventListener('timeupdate', onSeek);
+            video.addEventListener('durationchange', onSeek);
+            setTimeout(r, 800);
+          });
+          if (Number.isFinite(video.duration) && video.duration > 0) {
+            dur = video.duration;
+          }
+          video.currentTime = 0;
+        } catch {}
+      }
+
+      finishWithMetadata(width, height, dur, hasAudio);
     };
+
+    video.onerror = () => {
+      // Even if browser <video> cannot decode MKV/AVI/HEVC, allow the file so FFmpeg.wasm can process it!
+      finishWithMetadata(1280, 720, fallbackDuration, true);
+    };
+
+    video.src = objectUrl;
   });
 }

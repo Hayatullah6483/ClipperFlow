@@ -18,8 +18,7 @@ export const DesktopGuard: React.FC<DesktopGuardProps> = ({ children }) => {
     const checkDevice = () => {
       const ua = navigator.userAgent || navigator.vendor || (window as any).opera || '';
       const isPhoneUA = /Android.*Mobile|iPhone|iPod|BlackBerry|IEMobile|Opera Mini|Windows Phone|webOS/i.test(ua);
-      const isSmallScreen = window.innerWidth < 768 && window.matchMedia('(pointer: coarse)').matches;
-      setIsMobileDevice(isPhoneUA || isSmallScreen);
+      setIsMobileDevice(isPhoneUA);
     };
 
     checkDevice();

@@ -40,6 +40,9 @@ export interface Clip {
   progressMessage?: string;
   blobUrl?: string;
   blobSize?: number;
+  outputExtension?: string; // 'mp4' | 'webm'
+  outputMimeType?: string;
+  outputDimensions?: string; // e.g. '1920×1080 (16:9)'
   thumbnailUrl?: string;
   error?: string;
   createdAt: number;

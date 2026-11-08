@@ -5,27 +5,45 @@
 
 import { ProgressCallback } from './ffmpegService';
 
+export interface BrowserClipResult {
+  blob: Blob;
+  url: string;
+  extension: string;
+  mimeType: string;
+  width: number;
+  height: number;
+}
+
 /**
  * High-performance browser-native video cutter using HTML5 Canvas & MediaRecorder.
- * 100% client-side, zero external dependencies, hardware accelerated.
+ * Preserves 100% original video width, height, and aspect ratio.
  */
 export async function cutVideoWithBrowserEngine(
   sourceFile: File,
   startSeconds: number,
   endSeconds: number,
-  onProgress?: ProgressCallback
-): Promise<{ blob: Blob; url: string }> {
+  onProgress?: ProgressCallback,
+  knownDimensions?: { width?: number; height?: number }
+): Promise<BrowserClipResult> {
   return new Promise((resolve, reject) => {
     let objectUrl = '';
     let video: HTMLVideoElement | null = null;
     let recorder: MediaRecorder | null = null;
-    let audioCtx: AudioContext | null = null;
-    let animFrameId: number | null = null;
+    let frameIntervalId: ReturnType<typeof setInterval> | null = null;
+    let maxDurationTimerId: ReturnType<typeof setTimeout> | null = null;
     let isTerminated = false;
+    let hasStartedReady = false;
 
     const cleanup = () => {
       isTerminated = true;
-      if (animFrameId) cancelAnimationFrame(animFrameId);
+      if (frameIntervalId) {
+        clearInterval(frameIntervalId);
+        frameIntervalId = null;
+      }
+      if (maxDurationTimerId) {
+        clearTimeout(maxDurationTimerId);
+        maxDurationTimerId = null;
+      }
       if (video) {
         video.onerror = null;
         video.onloadedmetadata = null;
@@ -37,9 +55,6 @@ export async function cutVideoWithBrowserEngine(
           video.src = '';
         } catch {}
       }
-      if (audioCtx) {
-        audioCtx.close().catch(() => {});
-      }
       if (objectUrl) {
         URL.revokeObjectURL(objectUrl);
       }
@@ -50,42 +65,92 @@ export async function cutVideoWithBrowserEngine(
       video = document.createElement('video');
       video.playsInline = true;
       video.preload = 'auto';
-      // Muted is essential to satisfy browser autoplay restrictions without user gestures
       video.muted = true;
+      video.volume = 1;
 
-      onProgress?.(5, 'Initializing browser media engine...');
+      onProgress?.(8, 'Initializing browser media engine (8%)...');
 
       const loadTimeout = setTimeout(() => {
         cleanup();
         reject(new Error('Timed out waiting for video to load in browser engine.'));
       }, 15000);
 
+      const finishRecording = () => {
+        if (isTerminated) return;
+        try {
+          if (video && !video.paused) {
+            video.pause();
+          }
+        } catch {}
+        if (recorder && recorder.state === 'recording') {
+          try {
+            recorder.requestData();
+            recorder.stop();
+          } catch (err) {
+            cleanup();
+            reject(err);
+          }
+        }
+      };
+
       const onVideoReady = async () => {
+        if (hasStartedReady || isTerminated || !video) return;
+        // Wait until actual video dimensions are decoded so original aspect ratio is 100% preserved
+        if (video.videoWidth === 0 && video.readyState < 2) {
+          return;
+        }
+        hasStartedReady = true;
         clearTimeout(loadTimeout);
-        if (isTerminated || !video) return;
 
         try {
-          const width = video.videoWidth || 1280;
-          const height = video.videoHeight || 720;
-          const duration = Math.max(0.1, endSeconds - startSeconds);
+          // Strictly preserve original video width and height (and exact aspect ratio)
+          const rawWidth = video.videoWidth || knownDimensions?.width || 1280;
+          const rawHeight = video.videoHeight || knownDimensions?.height || 720;
+          // Ensure even pixel dimensions while keeping exact aspect ratio
+          const width = Math.max(2, Math.floor(rawWidth / 2) * 2);
+          const height = Math.max(2, Math.floor(rawHeight / 2) * 2);
 
-          onProgress?.(15, `Seeking to start frame (${startSeconds.toFixed(2)}s)...`);
+          const rawVideoDuration =
+            Number.isFinite(video.duration) && video.duration > 0 ? video.duration : endSeconds;
+          const effectiveEnd = Math.min(endSeconds, rawVideoDuration);
+          const duration = Math.max(0.1, effectiveEnd - startSeconds);
 
-          // Seek to start position
+          onProgress?.(
+            14,
+            `Seeking to ${startSeconds.toFixed(2)}s at ${width}×${height} (14%)...`
+          );
+
+          // Seek to exact start position
           video.currentTime = Math.max(0, startSeconds);
 
           await new Promise<void>((seekResolve) => {
             if (!video) return seekResolve();
-            const onSeeked = () => {
-              video?.removeEventListener('seeked', onSeeked);
+            let resolved = false;
+            const done = () => {
+              if (resolved) return;
+              resolved = true;
+              video?.removeEventListener('seeked', done);
               seekResolve();
             };
-            video.addEventListener('seeked', onSeeked);
-            // Safety timeout for seek
-            setTimeout(seekResolve, 2000);
+            video.addEventListener('seeked', done);
+            setTimeout(done, 1500);
           });
 
-          // Canvas for frame extraction
+          // Wait briefly for the decoded frame at startSeconds to be ready for painting
+          if (video && video.readyState < 2) {
+            await new Promise<void>((r) => {
+              const onCanPlay = () => {
+                video?.removeEventListener('canplay', onCanPlay);
+                r();
+              };
+              video?.addEventListener('canplay', onCanPlay);
+              setTimeout(r, 600);
+            });
+          }
+
+          if (isTerminated || !video) return;
+
+          // Create canvas with exact original video dimensions (100% original aspect ratio)
           const canvas = document.createElement('canvas');
           canvas.width = width;
           canvas.height = height;
@@ -96,55 +161,56 @@ export async function cutVideoWithBrowserEngine(
             return reject(new Error('Could not create Canvas 2D context.'));
           }
 
-          // Video stream at 30 fps
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = 'high';
+
+          // Paint initial frame at exact start timestamp before recorder starts
+          ctx.drawImage(video, 0, 0, width, height);
+
+          // Capture stream at 30 fps
           const canvasStream = canvas.captureStream(30);
           const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
 
-          // Attempt audio track capture via Web Audio (graceful fallback if unsupported/silent)
+          // Capture audio track if available
           try {
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            if (AudioContextClass) {
-              audioCtx = new AudioContextClass();
-              // Unmute video internally for audio node capture while keeping element muted on speakers
-              const unmutedVideo = video;
-              unmutedVideo.muted = false;
-              const sourceNode = audioCtx.createMediaElementSource(unmutedVideo);
-              const audioDest = audioCtx.createMediaStreamDestination();
-              sourceNode.connect(audioDest);
+            const vidAny = video as any;
+            const mediaStream: MediaStream | undefined =
+              typeof vidAny.captureStream === 'function'
+                ? vidAny.captureStream()
+                : typeof vidAny.mozCaptureStream === 'function'
+                ? vidAny.mozCaptureStream()
+                : undefined;
 
-              // Keep silent locally so user doesn't hear high-speed scrubbing
-              const silentGain = audioCtx.createGain();
-              silentGain.gain.value = 0;
-              sourceNode.connect(silentGain);
-              silentGain.connect(audioCtx.destination);
-
-              audioDest.stream.getAudioTracks().forEach((t) => tracks.push(t));
-              await audioCtx.resume();
+            if (mediaStream && mediaStream.getAudioTracks().length > 0) {
+              mediaStream.getAudioTracks().forEach((t) => tracks.push(t));
             }
-          } catch (audioErr) {
-            console.warn('Audio capture fallback (video will render without audio):', audioErr);
-            if (video) video.muted = true;
+          } catch {
+            // Ignore if captureStream is unavailable
           }
 
           const combinedStream = new MediaStream(tracks);
 
-          // Find supported mime type
-          let selectedMimeType = 'video/webm;codecs=vp9,opus';
-          if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
-            selectedMimeType = 'video/webm;codecs=vp8,opus';
-          }
-          if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
-            selectedMimeType = 'video/webm';
-          }
-          if (!MediaRecorder.isTypeSupported(selectedMimeType) && MediaRecorder.isTypeSupported('video/mp4')) {
-            selectedMimeType = 'video/mp4';
+          // Prefer standard MP4 (H.264/AAC) FIRST so downloaded files play natively everywhere without glitches
+          const mimeCandidates = [
+            'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+            'video/mp4;codecs=avc1',
+            'video/mp4',
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp8,opus',
+            'video/webm',
+          ];
+          let selectedMimeType = '';
+          for (const candidate of mimeCandidates) {
+            if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(candidate)) {
+              selectedMimeType = candidate;
+              break;
+            }
           }
 
           const videoBitsPerSecond = width * height >= 1920 * 1080 ? 12000000 : 8000000;
-          recorder = new MediaRecorder(combinedStream, {
-            mimeType: selectedMimeType,
-            videoBitsPerSecond,
-          });
+          recorder = selectedMimeType
+            ? new MediaRecorder(combinedStream, { mimeType: selectedMimeType, videoBitsPerSecond })
+            : new MediaRecorder(combinedStream);
 
           const chunks: Blob[] = [];
           recorder.ondataavailable = (e) => {
@@ -152,11 +218,15 @@ export async function cutVideoWithBrowserEngine(
           };
 
           recorder.onstop = () => {
-            const blob = new Blob(chunks, { type: selectedMimeType });
+            const finalMime = selectedMimeType || recorder?.mimeType || 'video/mp4';
+            const isMp4 = finalMime.toLowerCase().includes('mp4');
+            const cleanMime = isMp4 ? 'video/mp4' : 'video/webm';
+            const extension = isMp4 ? 'mp4' : 'webm';
+            const blob = new Blob(chunks, { type: cleanMime });
             const url = URL.createObjectURL(blob);
             cleanup();
-            onProgress?.(100, 'Clip rendered successfully!');
-            resolve({ blob, url });
+            onProgress?.(100, 'Clip processed in original resolution (100%)');
+            resolve({ blob, url, extension, mimeType: cleanMime, width, height });
           };
 
           recorder.onerror = (e) => {
@@ -164,52 +234,61 @@ export async function cutVideoWithBrowserEngine(
             reject(new Error(`MediaRecorder failed: ${e}`));
           };
 
-          // Frame draw loop
-          const drawFrame = () => {
+          const recordStartTime = performance.now();
+
+          // Continuous 30fps draw loop (33ms) that works even when tab is in background
+          frameIntervalId = setInterval(() => {
             if (isTerminated || !video) return;
 
-            if (video.ended || video.currentTime >= endSeconds) {
-              if (recorder && recorder.state === 'recording') {
-                recorder.stop();
-              }
+            const currentVidTime = video.currentTime;
+            const wallElapsed = (performance.now() - recordStartTime) / 1000;
+
+            if (
+              video.ended ||
+              currentVidTime >= effectiveEnd - 0.015 ||
+              wallElapsed >= duration + 0.5
+            ) {
+              finishRecording();
               return;
             }
 
-            ctx.drawImage(video, 0, 0, width, height);
+            try {
+              ctx.drawImage(video, 0, 0, width, height);
+            } catch {}
 
-            const elapsed = Math.max(0, video.currentTime - startSeconds);
+            const elapsed = Math.max(currentVidTime - startSeconds, wallElapsed);
             const ratio = Math.min(Math.max(elapsed / duration, 0), 1);
-            const percent = Math.min(Math.round(20 + ratio * 75), 96);
-            onProgress?.(percent, `Rendering video frames (${percent}%)...`);
+            const percent = Math.min(Math.max(Math.round(16 + ratio * 82), 16), 98);
+            onProgress?.(percent, `Processing clip at ${width}×${height} (${percent}%)...`);
+          }, 33);
 
-            animFrameId = requestAnimationFrame(drawFrame);
-          };
-
-          recorder.start(100);
-          await video.play().catch(() => {
-            // If play rejected, ensure muted and retry
-            if (video) {
-              video.muted = true;
-              return video.play();
-            }
-          });
-
-          drawFrame();
+          // Safety timer
+          maxDurationTimerId = setTimeout(() => {
+            finishRecording();
+          }, Math.ceil((duration + 2.5) * 1000));
 
           video.ontimeupdate = () => {
-            if (video && video.currentTime >= endSeconds) {
-              video.pause();
-              if (recorder && recorder.state === 'recording') {
-                recorder.stop();
-              }
+            if (video && video.currentTime >= effectiveEnd - 0.015) {
+              finishRecording();
             }
           };
 
           video.onended = () => {
-            if (recorder && recorder.state === 'recording') {
-              recorder.stop();
-            }
+            finishRecording();
           };
+
+          onProgress?.(16, `Processing clip at ${width}×${height} (16%)...`);
+          // Start recording as a single continuous stream (no 100ms chunk fragmentation)
+          recorder.start();
+
+          try {
+            await video.play();
+          } catch {
+            if (video) {
+              video.muted = true;
+              await video.play();
+            }
+          }
         } catch (innerErr) {
           cleanup();
           reject(innerErr);
@@ -217,6 +296,8 @@ export async function cutVideoWithBrowserEngine(
       };
 
       video.onloadedmetadata = () => onVideoReady();
+      video.onloadeddata = () => onVideoReady();
+      video.oncanplay = () => onVideoReady();
       video.onerror = () => {
         clearTimeout(loadTimeout);
         const err = video?.error;
@@ -225,10 +306,10 @@ export async function cutVideoWithBrowserEngine(
         reject(new Error(`Browser could not decode the source video container ${detail}`.trim()));
       };
 
-      // Set source after listeners are attached
       video.src = objectUrl;
+      video.load();
 
-      if (video.readyState >= 1) {
+      if (video.readyState >= 2) {
         onVideoReady();
       }
     } catch (err) {

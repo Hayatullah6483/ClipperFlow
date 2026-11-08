@@ -46,7 +46,9 @@ export const ClipList: React.FC<ClipListProps> = ({
 
   const pendingCount = clips.filter((c) => c.status === 'pending').length;
   const readyCount = clips.filter((c) => c.status === 'ready').length;
-  const processingCount = clips.filter((c) => c.status === 'processing').length;
+  const processingClips = clips.filter((c) => c.status === 'processing');
+  const processingCount = processingClips.length;
+  const activeProcessingClip = processingClips[0];
 
   const filteredClips = clips.filter((clip) => {
     if (filter === 'ready') return clip.status === 'ready';
@@ -74,8 +76,8 @@ export const ClipList: React.FC<ClipListProps> = ({
             </button>
           </div>
           <p className="text-xs text-zinc-500 mt-0.5">
-            {processingCount > 0
-              ? `Trimming ${processingCount} clip${processingCount > 1 ? 's' : ''} in background — keep adding more clips on the left!`
+            {activeProcessingClip
+              ? `Trimming "${activeProcessingClip.title}" (${Math.min(100, Math.max(1, Math.round(activeProcessingClip.progress)))}%) in background — keep cutting more clips!`
               : 'Queue up to 20 clips and process them in the background while you continue editing.'}
           </p>
         </div>
@@ -133,7 +135,17 @@ export const ClipList: React.FC<ClipListProps> = ({
       <div className="mb-3">
         <div className="flex items-center justify-between text-[11px] text-zinc-500 font-mono mb-1 tabular-nums">
           <span>Session Progress: {clips.length} of {Math.max(targetClipCount, clips.length)} clips created</span>
-          <span>{readyCount} ready · {processingCount} active · {pendingCount} queued</span>
+          <span>
+            {readyCount} ready ·{' '}
+            {activeProcessingClip ? (
+              <strong className="text-[#E32636]">
+                1 active ({Math.min(100, Math.max(1, Math.round(activeProcessingClip.progress)))}%)
+              </strong>
+            ) : (
+              `${processingCount} active`
+            )}{' '}
+            · {pendingCount} queued
+          </span>
         </div>
         <div className="w-full h-1.5 bg-zinc-100 rounded-full overflow-hidden flex">
           <div
